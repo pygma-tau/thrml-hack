@@ -472,7 +472,7 @@ def build_program_and_spaces() -> Tuple[BlockSamplingProgram, SamplingSchedule, 
     prog = BlockSamplingProgram(gibbs_spec=spec, samplers=samplers, interaction_groups=inter_groups)
 
     # Schedule and initial states
-    schedule = SamplingSchedule(n_warmup=2, n_samples=200, steps_per_sample=6)
+    schedule = SamplingSchedule(n_warmup=50, n_samples=100, steps_per_sample=6)
 
     # Initial design: choose midpoints
     init = [
@@ -555,7 +555,7 @@ def main():
     )
     print(intro)
     print("Sampling... (this requires thrml + jax)")
-    samples = sample_designs(prog, schedule, init, clamped, n_chains=1, seed=123)
+    samples = sample_designs(prog, schedule, init, clamped, n_chains=8, seed=123)
     top = summarize_topK(samples, oracle, spaces, K=12)
     print("\nTop designs (lower energy = better):\n")
     for rank, (e, meta, idxs) in enumerate(top, 1):
