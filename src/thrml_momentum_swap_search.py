@@ -58,6 +58,19 @@ import jax.numpy as jnp
 from jax.experimental import io_callback
 import equinox as eqx
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_HEATMAP_DIR = REPO_ROOT / "heatmaps"
+
+VAR_NAMES = ("L", "gamma", "I_minus", "DeltaS", "DeltaC", "tau")
+VAR_DISPLAY = {
+    "L": ("nH", 1e9, "{:.2f}"),
+    "gamma": ("", 1.0, "{:.1f}"),
+    "I_minus": ("nA", 1e9, "{:.0f}"),
+    "DeltaS": ("", 1.0, "{:.2f}"),
+    "DeltaC": ("", 1.0, "{:.2f}"),
+    "tau": ("\u221a(LC)", 1.0, "{:.2f}"),
+}
+
 from thrml.pgm import AbstractNode
 from thrml.block_management import Block
 from thrml.block_sampling import (
@@ -82,6 +95,20 @@ PI = np.pi
 
 def clip(v, lo, hi):
     return np.minimum(np.maximum(v, lo), hi)
+
+
+def _format_axis_label(var_name: str) -> str:
+    if var_name not in VAR_DISPLAY:
+        return var_name
+    unit, _, _ = VAR_DISPLAY[var_name]
+    return f"{var_name} [{unit}]" if unit else var_name
+
+
+def _format_axis_tick(var_name: str, value: float) -> str:
+    unit, scale, fmt = VAR_DISPLAY.get(var_name, ("", 1.0, "{:.2f}"))
+    scaled = value * scale
+    return fmt.format(scaled)
+
 
 # --------------------------
 # Design space
@@ -116,7 +143,12 @@ class DesignSpaces:
         ]
 
     def var_name(self, idx: int) -> str:
-        return ["L", "gamma", "I_minus", "DeltaS", "DeltaC", "tau"][idx]
+        return VAR_NAMES[idx]
+
+    def var_index(self, name: str) -> int:
+        if name not in VAR_NAMES:
+            raise ValueError(f"Unknown variable '{name}'. Choose from {VAR_NAMES}.")
+        return VAR_NAMES.index(name)
 
     def decode(self, indices: Sequence[int]) -> Dict[str, float]:
         L = float(self.L_values[indices[0]])
@@ -128,6 +160,19 @@ class DesignSpaces:
         return {"L": L, "gamma": gamma, "I_minus": I_minus,
                 "DeltaS": DeltaS, "DeltaC": DeltaC, "tau": tau,
                 "I_plus": float(self.I_plus), "kT_over_U0": float(self.kT_over_U0)}
+
+    def values_for(self, name: str) -> np.ndarray:
+        mapping = {
+            "L": self.L_values,
+            "gamma": self.gamma_values,
+            "I_minus": self.I_minus_values,
+            "DeltaS": self.DeltaS_values,
+            "DeltaC": self.DeltaC_values,
+            "tau": self.tau_values,
+        }
+        if name not in mapping:
+            raise ValueError(f"Unknown variable '{name}'. Choose from {VAR_NAMES}.")
+        return mapping[name]
 
 # --------------------------
 # JJ momentum-computing device model (fast surrogate pieces)
@@ -536,25 +581,107 @@ def sample_designs(
     print("  -> sampling complete")
     return batched  # list over blocks; each has shape [n_chains, n_samples, 1]
 
+
+def score_unique_designs(
+    samples: List[np.ndarray],
+    oracle: EnergyOracle,
+) -> List[Tuple[float, Dict[str, float], List[int]]]:
+    arrs = [np.asarray(b).reshape(-1) for b in samples]
+    if not arrs:
+        return []
+    seen = {}
+    for i in range(arrs[0].shape[0]):
+        idxs = [int(arrs[v][i]) for v in range(len(arrs))]
+        energy, meta = oracle.evaluate(idxs)
+        key = tuple(idxs)
+        if key not in seen or energy < seen[key][0]:
+            seen[key] = (energy, meta, idxs)
+    return list(seen.values())
+
+
+def build_energy_heatmap(
+    scored_designs: Sequence[Tuple[float, Dict[str, float], List[int]]],
+    spaces: DesignSpaces,
+    var_x: str,
+    var_y: str,
+    reduction: str = "min",
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    var_x = var_x.strip()
+    var_y = var_y.strip()
+    idx_x = spaces.var_index(var_x)
+    idx_y = spaces.var_index(var_y)
+    vals_x = spaces.values_for(var_x)
+    vals_y = spaces.values_for(var_y)
+    if reduction not in {"min", "mean"}:
+        raise ValueError("reduction must be either 'min' or 'mean'")
+    grid = np.full((len(vals_x), len(vals_y)), np.inf if reduction == "min" else 0.0, dtype=float)
+    counts = np.zeros_like(grid, dtype=np.int32)
+    for energy, _, idxs in scored_designs:
+        x_idx = int(idxs[idx_x])
+        y_idx = int(idxs[idx_y])
+        if reduction == "min":
+            if energy < grid[x_idx, y_idx]:
+                grid[x_idx, y_idx] = energy
+        else:
+            grid[x_idx, y_idx] += energy
+        counts[x_idx, y_idx] += 1
+    if reduction == "min":
+        grid[counts == 0] = np.nan
+    else:
+        averaged = np.full_like(grid, np.nan, dtype=float)
+        np.divide(grid, counts, out=averaged, where=counts > 0)
+        grid = averaged
+    return grid, counts, vals_x, vals_y
+
+
+def save_energy_heatmap(
+    grid: np.ndarray,
+    vals_x: np.ndarray,
+    vals_y: np.ndarray,
+    var_x: str,
+    var_y: str,
+    out_paths: Sequence[Path],
+    reduction: str,
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib as mpl
+    except ImportError as exc:
+        raise RuntimeError(
+            "matplotlib is required to save heatmaps; install it with `pip install matplotlib`."
+        ) from exc
+    paths = []
+    for raw in out_paths:
+        path = Path(raw)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        paths.append(path)
+    fig_width = max(4.0, len(vals_x) * 0.4)
+    fig_height = max(3.0, len(vals_y) * 0.4)
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    cmap = mpl.cm.get_cmap("magma").copy()
+    cmap.set_bad(color="#d9d9d9")
+    data = np.ma.masked_invalid(grid).T
+    im = ax.imshow(data, origin="lower", aspect="auto", cmap=cmap)
+    ax.set_xticks(np.arange(len(vals_x)))
+    ax.set_xticklabels([_format_axis_tick(var_x, float(v)) for v in vals_x], rotation=45, ha="right")
+    ax.set_yticks(np.arange(len(vals_y)))
+    ax.set_yticklabels([_format_axis_tick(var_y, float(v)) for v in vals_y])
+    ax.set_xlabel(_format_axis_label(var_x))
+    ax.set_ylabel(_format_axis_label(var_y))
+    ax.set_title(f"{reduction} energy heatmap: {var_x} vs {var_y}")
+    cbar = fig.colorbar(im, ax=ax, shrink=0.85)
+    cbar.set_label("Energy (a.u.)")
+    fig.tight_layout()
+    for path in paths:
+        fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
 def summarize_topK(samples: List[np.ndarray], oracle: EnergyOracle, spaces: DesignSpaces,
                    K: int = 10) -> List[Tuple[float, Dict[str, float], List[int]]]:
-    # Collapse chains & samples; score unique designs; return top-K
-    arrs = [np.asarray(b).reshape(-1) for b in samples]  # [num_vars] of shape [N]
-    N = arrs[0].shape[0]
-    results = []
-    for i in range(N):
-        idxs = [int(arrs[v][i]) for v in range(len(arrs))]
-        e, meta = oracle.evaluate(idxs)
-        results.append((e, meta, idxs))
-    # Deduplicate by indices
-    seen = {}
-    for e, meta, idxs in results:
-        key = tuple(idxs)
-        if key not in seen or e < seen[key][0]:
-            seen[key] = (e, meta, idxs)
-    uniq = list(seen.values())
-    uniq.sort(key=lambda x: x[0])
-    return uniq[:K]
+    scored = score_unique_designs(samples, oracle)
+    scored.sort(key=lambda x: x[0])
+    return scored[:K]
 
 # --------------------------
 # CLI demo
@@ -609,6 +736,24 @@ def main():
     parser.add_argument("--output-prefix", type=str, default="thrml_momentum_swap", help="Filename prefix for saved outputs")
     parser.add_argument("--topk", type=int, default=12, help="Number of best designs to report")
     parser.add_argument("--no-summary", action="store_true", help="Skip console summary (useful for non-zero workers)")
+    parser.add_argument(
+        "--heatmap-vars",
+        nargs=2,
+        metavar=("VAR_X", "VAR_Y"),
+        help=f"Generate a heatmap over two variables (options: {', '.join(VAR_NAMES)})",
+    )
+    parser.add_argument(
+        "--heatmap-stat",
+        choices=["min", "mean"],
+        default="min",
+        help="Statistic to aggregate energies per heatmap cell (default: min)",
+    )
+    parser.add_argument(
+        "--heatmap-out",
+        type=Path,
+        default=None,
+        help=f"Additional path to save the heatmap PNG (a copy is always stored under {DEFAULT_HEATMAP_DIR})",
+    )
     args = parser.parse_args()
 
     prog, schedule, init, clamped, spaces, oracle = build_program_and_spaces()
@@ -652,9 +797,38 @@ def main():
         chain_offset=global_start,
     )
 
-    top = summarize_topK(samples, oracle, spaces, K=args.topk)
+    scored_designs = score_unique_designs(samples, oracle)
+    scored_sorted = sorted(scored_designs, key=lambda x: x[0])
+    top = scored_sorted[: args.topk]
     if args.output_dir is not None:
         _save_worker_outputs(samples, top, args.output_dir, args.output_prefix, args.worker_rank)
+    if args.heatmap_vars is not None:
+        var_x, var_y = args.heatmap_vars
+        try:
+            grid, _counts, vals_x, vals_y = build_energy_heatmap(
+                scored_designs, spaces, var_x, var_y, reduction=args.heatmap_stat
+            )
+        except ValueError as exc:
+            print(f"Heatmap skipped: {exc}")
+        else:
+            heatmap_filename = f"{args.output_prefix}_{var_x}_{var_y}_heatmap.png"
+            repo_heatmap_path = DEFAULT_HEATMAP_DIR / heatmap_filename
+            save_paths = []
+            if args.heatmap_out is not None:
+                save_paths.append(Path(args.heatmap_out))
+            save_paths.append(repo_heatmap_path)
+            unique_paths: List[Path] = []
+            for path in save_paths:
+                resolved = path.resolve()
+                if all(resolved != existing.resolve() for existing in unique_paths):
+                    unique_paths.append(path)
+            save_energy_heatmap(grid, vals_x, vals_y, var_x, var_y, unique_paths, args.heatmap_stat)
+            filled = int(np.count_nonzero(~np.isnan(grid)))
+            total = grid.size
+            dests = ", ".join(str(p) for p in unique_paths)
+            print(
+                f"  -> saved heatmap to {dests} ({filled}/{total} cells covered, stat={args.heatmap_stat})"
+            )
 
     if not args.no_summary:
         print("\nTop designs (lower energy = better):\n")
