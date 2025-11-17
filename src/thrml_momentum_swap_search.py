@@ -30,7 +30,10 @@
 from __future__ import annotations
 
 import dataclasses
+import argparse
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Tuple, Sequence, Optional
 
 import numpy as np
@@ -491,10 +494,16 @@ def build_program_and_spaces() -> Tuple[BlockSamplingProgram, SamplingSchedule, 
 # Sampling helpers
 # --------------------------
 
-def sample_designs(prog: BlockSamplingProgram, schedule: SamplingSchedule,
-                   init_state: List[np.ndarray], clamped_states: List[np.ndarray],
-                   n_chains: int = 128, seed: int = 0) -> List[np.ndarray]:
-    key = jax.random.key(seed)
+def sample_designs(
+    prog: BlockSamplingProgram,
+    schedule: SamplingSchedule,
+    init_state: List[np.ndarray],
+    clamped_states: List[np.ndarray],
+    n_chains: int = 128,
+    seed: int = 0,
+    chain_offset: int = 0,
+) -> List[np.ndarray]:
+    key = jax.random.key(seed + chain_offset * 9973)
     free0 = [jnp.repeat(jnp.asarray(x)[None, ...], repeats=n_chains, axis=0) for x in init_state]
     clamp0 = [jnp.repeat(jnp.asarray(x)[None, ...], repeats=n_chains, axis=0) for x in clamped_states]
     keys = jax.random.split(key, n_chains)
@@ -503,8 +512,10 @@ def sample_designs(prog: BlockSamplingProgram, schedule: SamplingSchedule,
         return sample_states(k, prog, schedule, s_free, s_clamp, prog.gibbs_spec.free_blocks)
 
     per_block_samples: List[List[jnp.ndarray]] = [[] for _ in init_state]
-    print(f"  -> sampling {n_chains} chains x {schedule.n_samples} samples "
-          f"(warmup={schedule.n_warmup}, steps_per_sample={schedule.steps_per_sample})")
+    print(
+        f"  -> sampling {n_chains} chains x {schedule.n_samples} samples "
+        f"(warmup={schedule.n_warmup}, steps_per_sample={schedule.steps_per_sample}, offset={chain_offset})"
+    )
     batched = jax.vmap(one)(keys, free0, clamp0)
     print("  -> sampling complete")
     return batched  # list over blocks; each has shape [n_chains, n_samples, 1]
@@ -540,8 +551,58 @@ def _fmt_indices(idxs: Sequence[int], spaces: DesignSpaces) -> str:
         f"\u0394S={vals['DeltaS']:.2f}, \u0394C={vals['DeltaC']:.2f}, \u03c4={vals['tau']:.2f}\u221a(LC)"
     )
 
+def _partition_chains(total: int, num_workers: int, rank: int) -> tuple[int, int]:
+    if num_workers <= 1:
+        return 0, total
+    base = total // num_workers
+    remainder = total % num_workers
+    start = rank * base + min(rank, remainder)
+    count = base + (1 if rank < remainder else 0)
+    return start, count
+
+
+def _save_worker_outputs(
+    samples: List[np.ndarray],
+    summary: List[Tuple[float, Dict[str, float], List[int]]],
+    out_dir: Path,
+    prefix: str,
+    worker_rank: int,
+):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    data = {f"var{i}": np.asarray(arr) for i, arr in enumerate(samples)}
+    np.savez(out_dir / f"{prefix}_samples_rank{worker_rank}.npz", **data)
+    summary_payload = [
+        {"energy": float(e), "metrics": {k: float(v) if isinstance(v, (float, np.floating)) else v for k, v in meta.items()}, "indices": idxs}
+        for e, meta, idxs in summary
+    ]
+    with (out_dir / f"{prefix}_summary_rank{worker_rank}.json").open("w", encoding="utf-8") as fh:
+        json.dump(summary_payload, fh, indent=2)
+    print(f"  -> saved worker results under {out_dir}")
+
+
 def main():
+    parser = argparse.ArgumentParser(description="THRML-based momentum-swap circuit search")
+    parser.add_argument("--n-chains", type=int, default=96, help="Total number of parallel chains to run")
+    parser.add_argument("--n-samples", type=int, default=800, help="Samples per chain after warmup")
+    parser.add_argument("--steps-per-sample", type=int, default=6, help="Gibbs steps between recorded samples")
+    parser.add_argument("--n-warmup", type=int, default=100, help="Warmup iterations per chain")
+    parser.add_argument("--seed", type=int, default=123, help="Base RNG seed")
+    parser.add_argument("--num-workers", type=int, default=1, help="Number of distributed workers")
+    parser.add_argument("--worker-rank", type=int, default=0, help="Rank of this worker [0..num_workers-1]")
+    parser.add_argument("--output-dir", type=Path, default=None, help="Optional directory to save worker results")
+    parser.add_argument("--output-prefix", type=str, default="thrml_momentum_swap", help="Filename prefix for saved outputs")
+    parser.add_argument("--topk", type=int, default=12, help="Number of best designs to report")
+    parser.add_argument("--no-summary", action="store_true", help="Skip console summary (useful for non-zero workers)")
+    args = parser.parse_args()
+
     prog, schedule, init, clamped, spaces, oracle = build_program_and_spaces()
+    schedule = dataclasses.replace(
+        schedule,
+        n_warmup=args.n_warmup,
+        n_samples=args.n_samples,
+        steps_per_sample=args.steps_per_sample,
+    )
+
     intro = (
         "THRML momentum-computing bit-swap search\n"
         "----------------------------------------\n"
@@ -555,15 +616,38 @@ def main():
     )
     print(intro)
     print("Sampling... (this requires thrml + jax)")
-    samples = sample_designs(prog, schedule, init, clamped, n_chains=8, seed=123)
-    top = summarize_topK(samples, oracle, spaces, K=12)
-    print("\nTop designs (lower energy = better):\n")
-    for rank, (e, meta, idxs) in enumerate(top, 1):
-        print(
-            f"{rank:2d}. E={e:8.3f} | {_fmt_indices(idxs, spaces)} | "
-            f"beta={meta['beta']:.2f}, \u03b4\u03b2={meta['delta_beta']:.3e}, "
-            f"w\u03c6={meta['w_phi']:.2f}, w_dc={meta['w_dc']:.2f}, timing_pen={meta['timing_pen']:.4f}, n={int(meta['n_match'])}"
-        )
+
+    global_start, local_chains = _partition_chains(args.n_chains, args.num_workers, args.worker_rank)
+    if local_chains == 0:
+        print(f"Worker {args.worker_rank} has no chains assigned; exiting.")
+        return
+
+    print(
+        f"Worker {args.worker_rank}/{args.num_workers - 1 if args.num_workers > 1 else 0}: "
+        f"running {local_chains} chains (global offset {global_start})"
+    )
+    samples = sample_designs(
+        prog,
+        schedule,
+        init,
+        clamped,
+        n_chains=local_chains,
+        seed=args.seed,
+        chain_offset=global_start,
+    )
+
+    top = summarize_topK(samples, oracle, spaces, K=args.topk)
+    if args.output_dir is not None:
+        _save_worker_outputs(samples, top, args.output_dir, args.output_prefix, args.worker_rank)
+
+    if not args.no_summary:
+        print("\nTop designs (lower energy = better):\n")
+        for rank, (e, meta, idxs) in enumerate(top, 1):
+            print(
+                f"{rank:2d}. E={e:8.3f} | {_fmt_indices(idxs, spaces)} | "
+                f"beta={meta['beta']:.2f}, \u03b4\u03b2={meta['delta_beta']:.3e}, "
+                f"w\u03c6={meta['w_phi']:.2f}, w_dc={meta['w_dc']:.2f}, timing_pen={meta['timing_pen']:.4f}, n={int(meta['n_match'])}"
+            )
 
 if __name__ == "__main__":
     main()
