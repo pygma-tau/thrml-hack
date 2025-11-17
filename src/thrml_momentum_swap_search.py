@@ -27,6 +27,22 @@
 #
 # (c) 2025 — Public domain example for research prototyping.
 #
+
+'''
+export PYTHONPATH=src
+for rank in $(seq 0 7); do
+  CUDA_VISIBLE_DEVICES=$rank \
+  .venv/bin/python src/thrml_momentum_swap_search.py \
+    --n-chains 96 --n-samples 400 --steps-per-sample 4 --n-warmup 50 \
+    --num-workers 8 --worker-rank $rank --seed 123 \
+    --output-dir /tmp/thrml_runs --output-prefix h100 \
+    --no-summary &
+done
+wait
+'''
+
+
+
 from __future__ import annotations
 
 import dataclasses
